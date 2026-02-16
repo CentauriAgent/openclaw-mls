@@ -1,0 +1,9 @@
+{
+  "id": "mls",
+  "channels": ["mls"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

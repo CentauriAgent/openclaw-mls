@@ -1,0 +1,28 @@
+{
+  "name": "@openclaw/mls",
+  "version": "0.1.0",
+  "description": "OpenClaw MLS encrypted messaging channel plugin",
+  "type": "module",
+  "dependencies": {},
+  "devDependencies": {
+    "openclaw": "workspace:*"
+  },
+  "openclaw": {
+    "extensions": ["./index.ts"],
+    "channel": {
+      "id": "mls",
+      "label": "MLS",
+      "selectionLabel": "MLS (Encrypted Group Messaging)",
+      "docsPath": "/channels/mls",
+      "docsLabel": "mls",
+      "blurb": "End-to-end encrypted group messaging via MLS protocol",
+      "order": 60,
+      "quickstartAllowFrom": true
+    },
+    "install": {
+      "npmSpec": "@openclaw/mls",
+      "localPath": "extensions/mls",
+      "defaultChoice": "local"
+    }
+  }
+}
