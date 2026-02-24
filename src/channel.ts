@@ -83,6 +83,9 @@ export const mlsPlugin: ChannelPlugin<ResolvedMlsAccount> = {
   outbound: {
     deliveryMode: "direct",
     textChunkLimit: 4000,
+    sendMedia: async () => {
+      throw new Error("MLS channel does not support media");
+    },
     sendText: async ({ to, text, accountId }) => {
       const runtime = getMlsRuntime();
       const cfg = runtime.config.loadConfig();

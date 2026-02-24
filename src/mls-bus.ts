@@ -33,9 +33,31 @@ export async function startMlsBus(opts: MlsBusOptions): Promise<MlsBusHandle> {
   let reading = false;
   let closed = false;
 
+  // Dedup: track recent message hashes to filter relay duplicates
+  const DEDUP_WINDOW_MS = 30_000; // 30 seconds
+  const DEDUP_MAX_SIZE = 200;
+  const recentHashes = new Map<string, number>(); // hash -> timestamp
+
+  function dedup(msg: { senderPubkey: string; groupId: string; content: string }): boolean {
+    const key = `${msg.senderPubkey}:${msg.groupId}:${msg.content}`;
+    const now = Date.now();
+
+    // Prune old entries
+    if (recentHashes.size > DEDUP_MAX_SIZE) {
+      for (const [k, ts] of recentHashes) {
+        if (now - ts > DEDUP_WINDOW_MS) recentHashes.delete(k);
+      }
+    }
+
+    if (recentHashes.has(key)) return true; // duplicate
+    recentHashes.set(key, now);
+    return false;
+  }
+
   async function readNewLines() {
     if (reading || closed) return;
     reading = true;
+    const readId = Date.now();
 
     try {
       if (!existsSync(logPath)) {
@@ -73,7 +95,12 @@ export async function startMlsBus(opts: MlsBusOptions): Promise<MlsBusHandle> {
             parsed.senderPubkey !== selfPubkey &&
             parsed.content
           ) {
-            onMessage(parsed as MlsInboundMessage);
+            if (!dedup(parsed)) {
+              console.error(`[mls-bus][${readId}] DELIVER: ${parsed.content?.slice(0, 40)} (offset=${offset})`);
+              onMessage(parsed as MlsInboundMessage);
+            } else {
+              console.error(`[mls-bus][${readId}] DEDUP-SKIP: ${parsed.content?.slice(0, 40)}`);
+            }
           }
         } catch {
           // Skip malformed lines
