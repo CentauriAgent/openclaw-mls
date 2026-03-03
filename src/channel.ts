@@ -9,7 +9,7 @@ function formatPairingApproveHint(channel: string): string {
   return `To approve, add the sender's pubkey to channels.${channel}.allowFrom in your config.`;
 }
 import { startMlsBus, type MlsBusHandle } from "./mls-bus.js";
-import { sendMlsMessage } from "./mls-transport.js";
+import { sendMlsMessage, sendTypingIndicator, transcribeAudio, textToSpeech } from "./mls-transport.js";
 import { getMlsRuntime } from "./runtime.js";
 import {
   listMlsAccountIds,
@@ -161,23 +161,71 @@ export const mlsPlugin: ChannelPlugin<ResolvedMlsAccount> = {
       // MLS group ID for outbound (32-char hex, distinct from Nostr group ID)
       const mlsGroupId = "ce7f130ce1c36e46a4a9ad1caebed214";
 
+      // Keepalive: update lastEventAt every 5 minutes so the health monitor
+      // doesn't mark the channel as "stuck" during quiet periods.
+      // DEFAULT_STALE_EVENT_THRESHOLD_MS is 30 min; 5 min is well within that.
+      const keepaliveIntervalMs = 5 * 60_000;
+      let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+
+      function touchLastEventAt() {
+        ctx.setStatus?.({
+          accountId: account.accountId,
+          selfPubkey: account.selfPubkey,
+          lastEventAt: Date.now(),
+        } as any);
+      }
+
+      keepaliveTimer = setInterval(() => {
+        if (!closed) touchLastEventAt();
+      }, keepaliveIntervalMs);
+
+      // Touch immediately so lastEventAt is set from the start
+      touchLastEventAt();
+
       const bus = await startMlsBus({
         logPath,
         offsetPath,
         selfPubkey: account.selfPubkey,
         onMessage: async (msg) => {
+          // Touch lastEventAt on every inbound message so health monitor
+          // knows the channel is alive and actively receiving.
+          touchLastEventAt();
           const senderName = displayName(msg.senderPubkey);
           ctx.log?.info?.(`[${account.accountId}] inbound from ${senderName} in group ${msg.groupId}: ${msg.content.slice(0, 80)}`);
+
+          let messageBody = msg.content;
+          let isVoiceMessage = false;
+
+          // Detect media attachments: [📎 filename -> /path/to/file]
+          const mediaMatch = msg.content.match(/\[📎\s+(.+?)\s+->\s+(.+?)\]/);
+          if (mediaMatch) {
+            const [, filename, filePath] = mediaMatch;
+            const ext = filename.split('.').pop()?.toLowerCase() ?? '';
+            const audioExts = ['m4a', 'mp3', 'wav', 'ogg', 'opus', 'webm', 'flac', 'aac'];
+
+            if (audioExts.includes(ext)) {
+              isVoiceMessage = true;
+              ctx.log?.info?.(`[${account.accountId}] Voice message detected: ${filename}`);
+              try {
+                const transcription = await transcribeAudio(filePath);
+                messageBody = `[Voice message from ${senderName}]: "${transcription}"`;
+                ctx.log?.info?.(`[${account.accountId}] Transcribed: ${transcription.slice(0, 80)}`);
+              } catch (err) {
+                ctx.log?.error?.(`[${account.accountId}] Transcription failed: ${(err as Error).message}`);
+                messageBody = `[Voice message from ${senderName} - transcription failed. Audio file: ${filePath}]`;
+              }
+            }
+          }
 
           // Build session key: mls:<groupId>
           const sessionKey = `mls:${msg.groupId}`;
 
           // Build MsgContext for the OpenClaw dispatch pipeline
           const msgContext = {
-            Body: msg.content,
-            RawBody: msg.content,
-            CommandBody: msg.content,
-            BodyForCommands: msg.content,
+            Body: messageBody,
+            RawBody: messageBody,
+            CommandBody: messageBody,
+            BodyForCommands: messageBody,
             From: msg.senderPubkey,
             To: account.selfPubkey,
             SessionKey: sessionKey,
@@ -199,6 +247,7 @@ export const mlsPlugin: ChannelPlugin<ResolvedMlsAccount> = {
             const text = payload.text;
             if (!text?.trim()) return;
             try {
+              // Always send text reply
               await sendMlsMessage({
                 burrowPath: account.burrowPath,
                 burrowDir: account.burrowDir,
@@ -207,10 +256,44 @@ export const mlsPlugin: ChannelPlugin<ResolvedMlsAccount> = {
                 text,
               });
               ctx.log?.info?.(`[${account.accountId}] sent reply to MLS group ${mlsGroupId}`);
+
+              // If inbound was a voice message, also send a voice reply
+              if (isVoiceMessage) {
+                try {
+                  const { join } = await import("path");
+                  const ttsPath = join(dataDir, "media", `reply-${Date.now()}.m4a`);
+                  // Truncate long responses for TTS (max ~500 chars)
+                  const ttsText = text.length > 500 ? text.slice(0, 497) + "..." : text;
+                  await textToSpeech(ttsText, ttsPath);
+                  await sendMlsMessage({
+                    burrowPath: account.burrowPath,
+                    burrowDir: account.burrowDir,
+                    keyPath: account.keyPath,
+                    groupId: mlsGroupId,
+                    text: "",
+                    mediaPath: ttsPath,
+                  });
+                  ctx.log?.info?.(`[${account.accountId}] sent voice reply to MLS group ${mlsGroupId}`);
+                } catch (ttsErr) {
+                  ctx.log?.error?.(`[${account.accountId}] Voice reply failed: ${(ttsErr as Error).message}`);
+                }
+              }
             } catch (err) {
               ctx.log?.error?.(`[${account.accountId}] Failed to send MLS reply: ${(err as Error).message}`);
             }
           };
+
+          // Send typing indicator before processing
+          try {
+            await sendTypingIndicator({
+              burrowPath: account.burrowPath,
+              burrowDir: account.burrowDir,
+              keyPath: account.keyPath,
+              groupId: mlsGroupId,
+            });
+          } catch (e) {
+            ctx.log?.error?.(`[${account.accountId}] typing indicator failed: ${(e as Error).message}`);
+          }
 
           try {
             const cfg = runtime.config.loadConfig();
@@ -236,13 +319,25 @@ export const mlsPlugin: ChannelPlugin<ResolvedMlsAccount> = {
       activeBuses.set(account.accountId, bus);
       ctx.log?.info(`[${account.accountId}] MLS channel started, tailing ${logPath}`);
 
-      return {
-        stop: () => {
+      // Return a long-lived promise that only resolves when aborted/stopped.
+      // OpenClaw expects startAccount to stay alive; if it resolves, it auto-restarts.
+      let closed = false;
+      return new Promise<void>((resolve) => {
+        const onAbort = () => {
+          closed = true;
+          if (keepaliveTimer) {
+            clearInterval(keepaliveTimer);
+            keepaliveTimer = null;
+          }
           bus.close();
           activeBuses.delete(account.accountId);
           ctx.log?.info(`[${account.accountId}] MLS channel stopped`);
-        },
-      };
+          resolve();
+        };
+        if (ctx.abortSignal) {
+          ctx.abortSignal.addEventListener("abort", onAbort, { once: true });
+        }
+      });
     },
   },
 };

@@ -1,7 +1,7 @@
 import { watch, createReadStream, statSync, existsSync } from "fs";
-import { readFile, writeFile, stat } from "fs/promises";
+import { readFile, writeFile } from "fs/promises";
 import { createInterface } from "readline";
-import { join } from "path";
+import { createHash } from "crypto";
 import type { FSWatcher } from "fs";
 
 export interface MlsInboundMessage {
@@ -19,61 +19,65 @@ export interface MlsBusOptions {
   selfPubkey: string;
   onMessage: (msg: MlsInboundMessage) => void;
   onError?: (err: Error) => void;
+  /** Dedup window in ms — messages with the same key seen within this window
+   *  are silently dropped. Protects against double-dispatch on channel restart.
+   *  Default: 60_000 (1 minute). */
+  dedupWindowMs?: number;
 }
 
 export interface MlsBusHandle {
   close(): void;
 }
 
+/** Build a stable dedup key from a message. Uses timestamp+sender+content hash. */
+function dedupKey(msg: MlsInboundMessage): string {
+  const raw = `${msg.timestamp}|${msg.senderPubkey}|${msg.groupId}|${msg.content}`;
+  return createHash("sha256").update(raw).digest("hex").slice(0, 16);
+}
+
 export async function startMlsBus(opts: MlsBusOptions): Promise<MlsBusHandle> {
   const { logPath, offsetPath, selfPubkey, onMessage, onError } = opts;
+  const dedupWindowMs = opts.dedupWindowMs ?? 60_000;
 
   let offset = await loadOffset(offsetPath);
   let watcher: FSWatcher | null = null;
-  let reading = false;
   let closed = false;
+  let scheduled = false;
+  let reading = false;
 
-  // Dedup: track recent message hashes to filter relay duplicates
-  const DEDUP_WINDOW_MS = 30_000; // 30 seconds
-  const DEDUP_MAX_SIZE = 200;
-  const recentHashes = new Map<string, number>(); // hash -> timestamp
+  // Dedup cache: key → expiry timestamp
+  const recentMessages = new Map<string, number>();
 
-  function dedup(msg: { senderPubkey: string; groupId: string; content: string }): boolean {
-    const key = `${msg.senderPubkey}:${msg.groupId}:${msg.content}`;
+  /** Evict expired dedup keys to keep memory bounded. */
+  function evictExpired() {
     const now = Date.now();
-
-    // Prune old entries
-    if (recentHashes.size > DEDUP_MAX_SIZE) {
-      for (const [k, ts] of recentHashes) {
-        if (now - ts > DEDUP_WINDOW_MS) recentHashes.delete(k);
-      }
+    for (const [key, expiry] of recentMessages) {
+      if (now > expiry) recentMessages.delete(key);
     }
+  }
 
-    if (recentHashes.has(key)) return true; // duplicate
-    recentHashes.set(key, now);
+  /** Return true if this message was seen recently (duplicate); false and mark if new. */
+  function isDuplicate(msg: MlsInboundMessage): boolean {
+    evictExpired();
+    const key = dedupKey(msg);
+    if (recentMessages.has(key)) return true;
+    recentMessages.set(key, Date.now() + dedupWindowMs);
     return false;
   }
 
   async function readNewLines() {
     if (reading || closed) return;
     reading = true;
-    const readId = Date.now();
+    scheduled = false;
 
     try {
-      if (!existsSync(logPath)) {
-        reading = false;
-        return;
-      }
+      if (!existsSync(logPath)) return;
 
       const fileStat = statSync(logPath);
-      if (fileStat.size <= offset) {
-        // File may have been truncated/rotated
-        if (fileStat.size < offset) {
-          offset = 0;
-        }
-        reading = false;
-        return;
+      if (fileStat.size < offset) {
+        offset = 0; // file truncated/rotated
       }
+      if (fileStat.size <= offset) return;
 
       const stream = createReadStream(logPath, {
         start: offset,
@@ -84,7 +88,7 @@ export async function startMlsBus(opts: MlsBusOptions): Promise<MlsBusHandle> {
       let bytesRead = 0;
 
       for await (const line of rl) {
-        bytesRead += Buffer.byteLength(line, "utf-8") + 1; // +1 for newline
+        bytesRead += Buffer.byteLength(line, "utf-8") + 1;
         if (!line.trim()) continue;
 
         try {
@@ -95,12 +99,20 @@ export async function startMlsBus(opts: MlsBusOptions): Promise<MlsBusHandle> {
             parsed.senderPubkey !== selfPubkey &&
             parsed.content
           ) {
-            if (!dedup(parsed)) {
-              console.error(`[mls-bus][${readId}] DELIVER: ${parsed.content?.slice(0, 40)} (offset=${offset})`);
-              onMessage(parsed as MlsInboundMessage);
-            } else {
-              console.error(`[mls-bus][${readId}] DEDUP-SKIP: ${parsed.content?.slice(0, 40)}`);
+            // Filter out typing indicators
+            const content = parsed.content.trim();
+            if (content === "typing" || content === "stopped_typing") {
+              continue;
             }
+
+            const msg = parsed as MlsInboundMessage;
+
+            // Dedup guard: skip messages already dispatched in this window
+            if (isDuplicate(msg)) {
+              continue;
+            }
+
+            onMessage(msg);
           }
         } catch {
           // Skip malformed lines
@@ -113,7 +125,21 @@ export async function startMlsBus(opts: MlsBusOptions): Promise<MlsBusHandle> {
       onError?.(err as Error);
     } finally {
       reading = false;
+      // If watch events arrived while we were reading, schedule one more pass
+      if (scheduled && !closed) {
+        scheduled = false;
+        scheduleRead();
+      }
     }
+  }
+
+  function scheduleRead() {
+    if (scheduled || closed) return;
+    scheduled = true;
+    // Debounce: wait 50ms for fs.watch to settle before reading
+    setTimeout(() => {
+      if (!closed) readNewLines().catch((e) => onError?.(e as Error));
+    }, 50);
   }
 
   // Initial read
@@ -122,7 +148,7 @@ export async function startMlsBus(opts: MlsBusOptions): Promise<MlsBusHandle> {
   // Watch for changes
   try {
     watcher = watch(logPath, { persistent: false }, () => {
-      readNewLines().catch((e) => onError?.(e as Error));
+      scheduleRead();
     });
     watcher.on("error", (err) => onError?.(err));
   } catch (err) {
